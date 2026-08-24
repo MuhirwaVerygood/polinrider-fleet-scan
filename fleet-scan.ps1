@@ -311,7 +311,10 @@ function Remove-FakeFontPayloads {
 function Repair-VscodeTasksJson {
     param([string]$Root, [System.Collections.ArrayList]$Changes, [System.Collections.ArrayList]$NeedsReview)
 
-    $p = Join-Path $Root '.vscode\tasks.json'
+    # Forward slash even in the child segment - a literal backslash here is not
+    # a path separator on macOS/Linux, it is just a character in the filename
+    # Join-Path would go looking for (and never find).
+    $p = Join-Path $Root '.vscode/tasks.json'
     if (-not (Test-Path -LiteralPath $p)) { return }
 
     $c = [System.IO.File]::ReadAllText($p)
@@ -332,7 +335,7 @@ function Repair-VscodeTasksJson {
 function Repair-VscodeSettingsJson {
     param([string]$Root, [System.Collections.ArrayList]$Changes, [System.Collections.ArrayList]$NeedsReview)
 
-    $p = Join-Path $Root '.vscode\settings.json'
+    $p = Join-Path $Root '.vscode/settings.json'
     if (-not (Test-Path -LiteralPath $p)) { return }
 
     $raw = [System.IO.File]::ReadAllText($p)
@@ -396,7 +399,7 @@ function Repair-VscodeSettingsJson {
 function Repair-VscodeLaunchJson {
     param([string]$Root, [System.Collections.ArrayList]$Changes, [System.Collections.ArrayList]$NeedsReview)
 
-    $p = Join-Path $Root '.vscode\launch.json'
+    $p = Join-Path $Root '.vscode/launch.json'
     if (-not (Test-Path -LiteralPath $p)) { return }
 
     $raw = [System.IO.File]::ReadAllText($p)

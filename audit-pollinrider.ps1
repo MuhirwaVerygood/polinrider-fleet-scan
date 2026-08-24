@@ -64,6 +64,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# $IsWindows/$IsLinux/$IsMacOS only exist on PowerShell 6+; Windows PowerShell
+# 5.1 predates them and only ever runs on Windows, so PSVersion < 6 implies
+# Windows regardless. Host-scan code below branches on this instead of
+# hardcoding paths for one OS.
+$Script:OnWindows = ($PSVersionTable.PSVersion.Major -lt 6) -or $IsWindows
+
 # ---------------------------------------------------------------------------
 # Indicator set
 # ---------------------------------------------------------------------------
@@ -633,25 +639,44 @@ function Get-NpmCliCandidates {
     $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
     if ($nodeCmd) {
         $nd = Split-Path $nodeCmd.Source -Parent
-        foreach ($rel in @('node_modules\npm\lib\cli.js', '..\lib\node_modules\npm\lib\cli.js')) {
+        # Forward slash even where Windows would accept a literal backslash -
+        # this is a single string passed as one ChildPath, and on macOS/Linux a
+        # backslash inside it is just a character, not a separator.
+        foreach ($rel in @('node_modules/npm/lib/cli.js', '../lib/node_modules/npm/lib/cli.js')) {
             $c = Join-Path $nd $rel
             if (Test-Path -LiteralPath $c) { $null = $candidates.Add((Resolve-Path $c).Path) }
         }
     }
 
-    # Every nvm-windows version installed, active or not - a "clean" reinstall
-    # has been observed reinfected within hours.
-    $roots = @(
-        (Join-Path $env:LOCALAPPDATA 'nvm'),
-        (Join-Path $env:APPDATA 'npm'),
-        'C:\Program Files\nodejs',
-        'C:\nvm4w\nodejs'
-    )
+    # Every install this machine has, active or not - a "clean" reinstall has
+    # been observed reinfected within hours, so all of them are worth checking.
+    # Wildcard segments (nvm/volta version dirs) need Resolve-Path to expand,
+    # not Test-Path -LiteralPath, which takes a glob literally.
+    if ($Script:OnWindows) {
+        $roots = @(
+            (Join-Path $env:LOCALAPPDATA 'nvm'),
+            (Join-Path $env:APPDATA 'npm'),
+            'C:\Program Files\nodejs',
+            'C:\nvm4w\nodejs'
+        )
+    }
+    else {
+        $roots = @(
+            (Join-Path $HOME '.nvm/versions/node/*/lib/node_modules/npm'),
+            (Join-Path $HOME '.volta/tools/image/node/*/lib/node_modules/npm'),
+            '/usr/local/lib/node_modules/npm',
+            '/usr/lib/node_modules/npm',
+            '/opt/homebrew/lib/node_modules/npm',
+            '/usr/local/Cellar/node/*/lib/node_modules/npm'
+        )
+    }
     foreach ($root in $roots) {
-        if (-not (Test-Path -LiteralPath $root)) { continue }
-        Get-ChildItem -LiteralPath $root -Recurse -File -Filter 'cli.js' -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match '[\\/]npm[\\/]lib[\\/]cli\.js$' } |
-            ForEach-Object { $null = $candidates.Add($_.FullName) }
+        $expanded = @(Resolve-Path -Path $root -ErrorAction SilentlyContinue)
+        foreach ($r in $expanded) {
+            Get-ChildItem -LiteralPath $r.Path -Recurse -File -Filter 'cli.js' -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '[\\/]npm[\\/]lib[\\/]cli\.js$' } |
+                ForEach-Object { $null = $candidates.Add($_.FullName) }
+        }
     }
 
     return @($candidates | Sort-Object -Unique)
@@ -698,29 +723,57 @@ function Test-HostNpmCli {
     }
 }
 
+function Get-NodeProcessCommandLines {
+    # PID/command-line pairs, one gathering method per OS - Win32_Process only
+    # exists on Windows (calling it on macOS/Linux throws CommandNotFoundException,
+    # not a catchable cmdlet error, so it must never even be reached there), and
+    # `ps` is what pollinrider-scan.sh already uses on Unix, kept identical here
+    # so both detectors agree on what a "live process" scan means.
+    $out = New-Object System.Collections.ArrayList
+
+    if ($Script:OnWindows) {
+        $procs = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue
+        foreach ($p in $procs) {
+            if ($p.CommandLine) {
+                $null = $out.Add([pscustomobject]@{ Pid = $p.ProcessId; CommandLine = $p.CommandLine })
+            }
+        }
+    }
+    else {
+        $lines = & ps -eo pid,args 2>$null
+        foreach ($line in $lines) {
+            if ($line -notmatch 'node') { continue }
+            $m = [regex]::Match($line, '^\s*(\d+)\s+(.*)$')
+            if ($m.Success) {
+                $null = $out.Add([pscustomobject]@{ Pid = $m.Groups[1].Value; CommandLine = $m.Groups[2].Value })
+            }
+        }
+    }
+
+    return @($out)
+}
+
 function Test-HostProcesses {
-    $procs = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue
-    foreach ($p in $procs) {
+    foreach ($p in (Get-NodeProcessCommandLines)) {
         $cmd = $p.CommandLine
-        if (-not $cmd) { continue }
 
         $hasInj = ($cmd.Contains($IOC.globalV1) -or $cmd.Contains($IOC.globalV2))
         $hasLoader = $cmd.Contains($IOC.globalReq) -and $cmd.Contains($IOC.globalMod)
         if ($hasInj -and $hasLoader) {
-            Add-Finding -Severity 'CRITICAL' -Category 'Host' -File "PID $($p.ProcessId)" -Line 0 `
+            Add-Finding -Severity 'CRITICAL' -Category 'Host' -File "PID $($p.Pid)" -Line 0 `
                 -Indicator 'PolinRider loader running as a live process' `
                 -Evidence 'Command line carries the injection marker with the require/module loader pair'
         }
         foreach ($ip in $IOC.c2Ips) {
             if ($cmd.Contains($ip)) {
-                Add-Finding -Severity 'CRITICAL' -Category 'Host' -File "PID $($p.ProcessId)" -Line 0 `
+                Add-Finding -Severity 'CRITICAL' -Category 'Host' -File "PID $($p.Pid)" -Line 0 `
                     -Indicator 'Live process connecting to a known PolinRider C2' -Evidence $ip
             }
         }
         if ($IOC.xorKeys) {
             foreach ($k in $IOC.xorKeys) {
                 if ($cmd.Contains($k)) {
-                    Add-Finding -Severity 'CRITICAL' -Category 'Host' -File "PID $($p.ProcessId)" -Line 0 `
+                    Add-Finding -Severity 'CRITICAL' -Category 'Host' -File "PID $($p.Pid)" -Line 0 `
                         -Indicator 'Live process carrying the PolinRider XOR decode key' -Evidence ''
                 }
             }
@@ -751,18 +804,31 @@ function Test-HostProcesses {
 # ---------------------------------------------------------------------------
 
 function Get-VsCodeAppOutDirs {
-    $roots = @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code Insiders'),
-        'C:\Program Files\Microsoft VS Code',
-        'C:\Program Files\Microsoft VS Code Insiders',
-        '/usr/share/code',
-        '/Applications/Visual Studio Code.app/Contents/Resources'
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    # $env:LOCALAPPDATA is unset (null) on macOS/Linux, and Join-Path throws on
+    # a null Path under EAP=Stop - so those entries only ever get built on
+    # Windows, where the variable is guaranteed to exist.
+    $roots = if ($Script:OnWindows) {
+        @(
+            (Join-Path $env:LOCALAPPDATA 'Programs/Microsoft VS Code'),
+            (Join-Path $env:LOCALAPPDATA 'Programs/Microsoft VS Code Insiders'),
+            'C:\Program Files\Microsoft VS Code',
+            'C:\Program Files\Microsoft VS Code Insiders'
+        )
+    }
+    else {
+        @(
+            '/usr/share/code',
+            '/usr/share/code-insiders',
+            '/snap/code/current/usr/share/code',
+            '/Applications/Visual Studio Code.app/Contents/Resources',
+            '/Applications/Visual Studio Code - Insiders.app/Contents/Resources'
+        )
+    }
+    $roots = $roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 
     $found = New-Object System.Collections.ArrayList
     foreach ($root in $roots) {
-        foreach ($pat in @('resources\app\out', '*\resources\app\out', 'app\out')) {
+        foreach ($pat in @('resources/app/out', '*/resources/app/out', 'app/out')) {
             $cands = @()
             try { $cands = Get-Item -Path (Join-Path $root $pat) -ErrorAction SilentlyContinue } catch {}
             foreach ($c in $cands) {

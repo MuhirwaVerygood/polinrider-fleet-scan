@@ -422,7 +422,7 @@ for f in $(git ls-files '*.woff' '*.woff2' '*.ttf' '*.otf' '*.ttc' '*.eot' 2>/de
 done
 
 # --- 6. Propagation artifacts and .gitignore cloaking. ---------------------
-for a in temp_auto_push.bat config.bat temp_interactive_push.bat; do
+for a in branch_structure.json temp_auto_push.bat config.bat temp_interactive_push.bat; do
     if [ -f "$a" ]; then
         report CRITICAL "Propagation artifact present: $a" \
             "Evidence of compromise even if the payload was cleaned"

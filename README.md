@@ -60,11 +60,22 @@ cleans up what it's confident about, and hands you a PR. You merge it.
 
 ## Prerequisites
 
-- **PowerShell** — Windows PowerShell 5.1 (ships with every Windows install)
-  or PowerShell 7+.
+Runs the same way on Windows, macOS and Linux:
+
+- **PowerShell** — Windows PowerShell 5.1 (ships with every Windows install),
+  or [PowerShell 7+](https://github.com/PowerShell/PowerShell#get-powershell)
+  (`pwsh`) on macOS/Linux, where it doesn't ship by default and needs a
+  one-time install.
 - **[GitHub CLI (`gh`)](https://cli.github.com/)**, authenticated:
   `gh auth login`, then `gh auth status` should succeed.
 - **git** on `PATH`.
+
+On macOS/Linux, invoke it as `pwsh ./fleet-scan.ps1 -Owners ...` (or
+`pwsh ./audit-pollinrider.ps1 ...`) instead of `.\fleet-scan.ps1`. Host-level
+checks (npm's own install, live node processes, the VS Code entry point) look
+in the right OS-specific places on all three platforms — nvm/Homebrew/Volta
+install paths on macOS/Linux, `ps` instead of WMI for process enumeration —
+not just the Windows locations.
 
 No Node, no other dependencies. All detector logic is vendored into this
 directory (see below) so the project is self-contained — it does not depend on
