@@ -272,9 +272,14 @@ scan_editor_injection() {
                 ;;
         esac
 
-        for f in "$out"/main.*.cjs "$out"/main.*.mjs; do
+        # Any extension, not just .cjs/.mjs - the dropper has also turned up as
+        # main.js.inz.orig (a backup of the pre-patch original, dropped by the
+        # injector itself before it overwrites main.js). main.js.map is the
+        # only sibling Microsoft ships, so anything else named main.* here is
+        # unexpected regardless of what comes after "main.".
+        for f in "$out"/main.*; do
             [ -f "$f" ] || continue
-            case "$f" in *.js.map) continue ;; esac
+            case "$f" in */main.js|*/main.js.map) continue ;; esac
             report CRITICAL \
                 "Unexpected module planted beside VS Code main.js" \
                 "$f ($(wc -c < "$f" 2>/dev/null | tr -d ' ') bytes)"

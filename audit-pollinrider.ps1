@@ -811,6 +811,7 @@ function Get-VsCodeAppOutDirs {
         @(
             (Join-Path $env:LOCALAPPDATA 'Programs/Microsoft VS Code'),
             (Join-Path $env:LOCALAPPDATA 'Programs/Microsoft VS Code Insiders'),
+            (Join-Path $env:LOCALAPPDATA 'Programs/VSCodium'),
             'C:\Program Files\Microsoft VS Code',
             'C:\Program Files\Microsoft VS Code Insiders'
         )
@@ -819,12 +820,18 @@ function Get-VsCodeAppOutDirs {
         @(
             '/usr/share/code',
             '/usr/share/code-insiders',
+            '/usr/share/codium',
+            '/opt/visual-studio-code',
+            '/opt/vscode',
             '/snap/code/current/usr/share/code',
+            '/var/lib/flatpak/app/com.visualstudio.code/current/active/files/share/code',
+            (Join-Path $HOME '.local/share/code'),
             '/Applications/Visual Studio Code.app/Contents/Resources',
-            '/Applications/Visual Studio Code - Insiders.app/Contents/Resources'
+            '/Applications/Visual Studio Code - Insiders.app/Contents/Resources',
+            (Join-Path $HOME 'Applications/Visual Studio Code.app/Contents/Resources')
         )
     }
-    $roots = $roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    $roots = @($roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
 
     $found = New-Object System.Collections.ArrayList
     foreach ($root in $roots) {
@@ -838,6 +845,22 @@ function Get-VsCodeAppOutDirs {
             }
         }
     }
+
+    # Remote/SSH-target installs keep a versioned bin directory per commit -
+    # a different layout entirely, not resources/app/out.
+    if (-not $Script:OnWindows) {
+        foreach ($serverRoot in @(
+            (Join-Path $HOME '.vscode-server/bin'),
+            (Join-Path $HOME '.vscode-server-insiders/bin')
+        )) {
+            if (-not (Test-Path -LiteralPath $serverRoot)) { continue }
+            Get-ChildItem -LiteralPath $serverRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $outDir = Join-Path $_.FullName 'out'
+                if (Test-Path -LiteralPath (Join-Path $outDir 'main.js')) { $null = $found.Add($outDir) }
+            }
+        }
+    }
+
     return @($found | Sort-Object -Unique)
 }
 
@@ -869,9 +892,13 @@ function Test-HostEditorInjection {
         }
 
         # The dropper lands beside main.js; main.js.map is the only sibling
-        # Microsoft ships, so any other main.* module here is unexpected.
+        # Microsoft ships, so any other main.* module here is unexpected -
+        # any extension, not just .cjs/.mjs/.js. It has also turned up as
+        # main.js.inz.orig: a backup of the pre-patch original that the
+        # injector writes before it overwrites main.js itself, which a
+        # cjs/mjs/js-only extension check silently misses.
         Get-ChildItem -LiteralPath $out -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '^main\..+\.(cjs|mjs|js)$' -and $_.Name -ne 'main.js.map' } |
+            Where-Object { $_.Name -match '^main\..+$' -and $_.Name -ne 'main.js' -and $_.Name -ne 'main.js.map' } |
             ForEach-Object {
                 Add-Finding -Severity 'CRITICAL' -Category 'Host' -File "VS Code ($($_.FullName))" -Line 0 `
                     -Indicator 'Unexpected module planted beside VS Code main.js' `
