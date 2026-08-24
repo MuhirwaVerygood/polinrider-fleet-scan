@@ -37,17 +37,14 @@ a separate, gated step at all.
 Real cleanups run during this project's own incident response needed a human
 in the loop more than once:
 
-- One repo's `.vscode/settings.json` mixed the campaign's two injected keys in
-  with a developer's real Java and TypeScript settings. Getting that right
-  meant parsing the file as an object and removing exactly two keys — never
-  regexing or deleting the file outright. A different repo's `settings.json`
-  might not parse cleanly at all (JSONC comments, trailing commas, hand
-  edits); when that happens this tool flags it for manual review instead of
-  guessing.
-- `.vscode/launch.json` routinely holds real, unrelated debug configurations
-  sitting right next to the campaign's injected one. This tool only ever
-  flags `launch.json` — it will never edit it — because deciding which array
-  entry is safe to delete needs a human who knows what the file is for.
+- `.vscode/` is where this campaign hides its kit, but repos also legitimately
+  commit shared editor config there (formatter settings, recommended
+  extensions, real debug configs). This tool resolves that by removing
+  `.vscode/` wholesale rather than trying to parse out just the malicious
+  parts — deliberately blunt, and exactly why it stays behind a PR a human
+  merges instead of running unattended: if a repo's `.vscode/` really was
+  legitimate team config, that's now visible in the diff for someone to catch
+  before it lands, not silently gone.
 - A GitOps values file needed a human to confirm which change was cosmetic
   cargo (safe to delete) and which was a live deployment path (not safe to
   touch), something no static scan of that repo alone could have told you.
@@ -119,28 +116,26 @@ Exit code is `0` if every repo scanned clean, `1` if anything was found
 authenticated, no `-Owners`/`-Repos` given, etc.) — so it's safe to wire into
 a scheduled job and alert on non-zero.
 
-## What gets fixed automatically vs. flagged for review
+## What gets fixed automatically
 
-Fixed automatically, only on a confident content-based match (never on
-filename alone):
+Only ever on a confident content-based match (never on filename alone), a
+repair run:
 
 - The fake font payload (verified by content — not simply anything named
   `fa-solid-400.woff2`, actually checked for missing font magic bytes and
   embedded JavaScript, so a legitimately renamed font is never touched)
-- The canned `.vscode/tasks.json` autorun kit
-- The two campaign-injected keys inside `.vscode/settings.json`, leaving
-  every other setting in the file untouched
-- Known propagation artifacts (e.g. `temp_auto_push.bat`) and the `.gitignore`
-  lines added to hide them
+- The entire `.vscode/` directory, not just the malicious files in it — see
+  "Why it never auto-merges" above for the reasoning — plus adding `.vscode/`
+  to `.gitignore` so it doesn't come back
+- Known propagation artifacts (e.g. `temp_auto_push.bat`, `branch_structure.json`)
+  and the `.gitignore` lines added to hide them
 - Installing this project's own commit/push detection gate into `.githooks/`
 
-Always flagged for manual review, never auto-edited:
-
-- `.vscode/launch.json` (real debug configs routinely sit next to the
-  injected one)
-- A `settings.json` that matches enough indicators to be suspicious but
-  doesn't parse cleanly
-- A generic `folderOpen` task that isn't a confirmed match for the known kit
+Detection (the read-only scan pass) still checks the specific injected
+markers inside `tasks.json`/`settings.json`/`launch.json` individually — that
+granularity is what tells you *why* a repo is flagged — the repair pass just
+doesn't try to preserve anything inside `.vscode/` once a repo is confirmed
+compromised.
 
 ## Files in this project
 

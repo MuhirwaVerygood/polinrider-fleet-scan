@@ -308,109 +308,40 @@ function Remove-FakeFontPayloads {
     }
 }
 
-function Repair-VscodeTasksJson {
-    param([string]$Root, [System.Collections.ArrayList]$Changes, [System.Collections.ArrayList]$NeedsReview)
+function Remove-VscodeDirectory {
+    param([string]$Root, [System.Collections.ArrayList]$Changes)
 
-    # Forward slash even in the child segment - a literal backslash here is not
-    # a path separator on macOS/Linux, it is just a character in the filename
-    # Join-Path would go looking for (and never find).
-    $p = Join-Path $Root '.vscode/tasks.json'
-    if (-not (Test-Path -LiteralPath $p)) { return }
-
-    $c = [System.IO.File]::ReadAllText($p)
-    $isKit = ($c.IndexOf($IOC.kitTaskLabel, [System.StringComparison]::Ordinal) -ge 0) -and
-             ($c.IndexOf($IOC.kitTaskProbe, [System.StringComparison]::Ordinal) -ge 0)
-
-    if ($isKit) {
-        # Every sample seen has this file as 100% attacker content - no
-        # legitimate task has ever coexisted in it. Whole-file removal is safe.
-        Remove-Item -LiteralPath $p -Force
-        $null = $Changes.Add("Removed .vscode/tasks.json (canned autorun kit)")
+    # Policy as of 2026-08-24: remove .vscode/ wholesale on any repair run and
+    # gitignore it going forward, rather than surgically stripping just the
+    # confirmed-malicious keys/files. .vscode/ is exactly where this campaign
+    # hides its autorun kit, and editor config has no business being pushed to
+    # a shared repo in the first place. This does mean a repo that
+    # deliberately commits shared team settings (formatter config, recommended
+    # extensions, real launch configs) loses that too - there is no signature
+    # check that can tell "team convention" apart from "attacker kit" once the
+    # answer is "remove the whole directory" rather than "remove the two known
+    # keys", so anyone relying on a committed .vscode/ should expect this and
+    # can restore what they want from the PR's parent commit.
+    $vscodeDir = Join-Path $Root '.vscode'
+    if (Test-Path -LiteralPath $vscodeDir -PathType Container) {
+        Remove-Item -LiteralPath $vscodeDir -Recurse -Force
+        $null = $Changes.Add("Removed .vscode/ entirely - not just the malicious files in it - and added it to .gitignore")
     }
-    elseif ($c -match 'runOn.{0,20}folderOpen') {
-        $null = $NeedsReview.Add(".vscode/tasks.json has a folderOpen task that does not match the known kit signature - review by hand")
-    }
-}
 
-function Repair-VscodeSettingsJson {
-    param([string]$Root, [System.Collections.ArrayList]$Changes, [System.Collections.ArrayList]$NeedsReview)
-
-    $p = Join-Path $Root '.vscode/settings.json'
-    if (-not (Test-Path -LiteralPath $p)) { return }
-
-    $raw = [System.IO.File]::ReadAllText($p)
-    $matched = 0
-    foreach ($k in $IOC.kitSettingsKeys) {
-        if ($raw.IndexOf($k, [System.StringComparison]::Ordinal) -ge 0) { $matched++ }
-    }
-    if ($matched -lt 3) { return }  # not a confident match - leave it alone
-
-    try {
-        # settings.json is JSONC in practice (trailing commas, // comments).
-        # Strip just enough of that to parse it, edit as an object, and only
-        # ever remove the two specific keys known to belong to the kit.
-        #
-        # ConvertFrom-Json's -AsHashtable switch does not exist in Windows
-        # PowerShell 5.1 (PS 6+ only), and this project must run on the 5.1 that
-        # ships with every Windows box - so this edits the PSCustomObject
-        # ConvertFrom-Json actually returns here, via .PSObject.Properties,
-        # rather than hashtable indexing.
-        $jsonish = $raw -replace '(?m)^\s*//.*$', ''
-        $jsonish = $jsonish -replace ',(\s*[}\]])', '$1'
-        $obj = $jsonish | ConvertFrom-Json -ErrorAction Stop
-        $propNames = @($obj.PSObject.Properties.Name)
-
-        $removedKey = $false
-        if ($propNames -contains 'task.allowAutomaticTasks') {
-            $obj.PSObject.Properties.Remove('task.allowAutomaticTasks'); $removedKey = $true
-        }
-        if ($propNames -contains 'tasks' -and ($obj.tasks -is [pscustomobject]) -and
-            (@($obj.tasks.PSObject.Properties.Name) -contains 'runOn')) {
-            $obj.PSObject.Properties.Remove('tasks'); $removedKey = $true  # the decoy block, not a real setting
-        }
-
-        if (-not $removedKey) {
-            $null = $NeedsReview.Add(".vscode/settings.json matched $matched/$($IOC.kitSettingsKeys.Count) kit markers but the known bad keys were not found in a parseable shape - review by hand")
-            return
-        }
-
-        $remaining = @($obj.PSObject.Properties).Count
-        if ($remaining -eq 0) {
-            Remove-Item -LiteralPath $p -Force
-            $null = $Changes.Add("Removed .vscode/settings.json (canned kit, no real settings left after stripping)")
-        }
-        else {
-            # ConvertTo-Json always emits "key":  value (two spaces) as its fixed
-            # key/value separator - embedded quotes in string values are always
-            # \"-escaped, so this literal sequence can only ever be that
-            # separator, never string content. Collapsing it to one space keeps
-            # the PR diff close to the original file instead of reformatting
-            # every line the reviewer has to read.
-            $out = ($obj | ConvertTo-Json -Depth 20) -replace '":  ', '": '
-            Set-Content -LiteralPath $p -Value $out
-            $null = $Changes.Add("Stripped kit keys from .vscode/settings.json, kept $remaining real setting(s)")
+    $gi = Join-Path $Root '.gitignore'
+    if (Test-Path -LiteralPath $gi) {
+        $existing = [System.IO.File]::ReadAllText($gi)
+        if ($existing -notmatch '(?m)^\s*\.vscode/?\s*$') {
+            $sep = if ($existing -and -not $existing.EndsWith("`n")) { "`n" } else { "" }
+            $addition = "${sep}`n# Editor config should not be pushed to a shared repo - also where PolinRider hides its autorun kit.`n.vscode/`n"
+            [System.IO.File]::AppendAllText($gi, $addition)
+            $null = $Changes.Add("Added .vscode/ to .gitignore")
         }
     }
-    catch {
-        $null = $NeedsReview.Add(".vscode/settings.json matched $matched/$($IOC.kitSettingsKeys.Count) kit markers but could not be parsed safely - review by hand ($($_.Exception.Message))")
+    else {
+        [System.IO.File]::WriteAllText($gi, "# Editor config should not be pushed to a shared repo - also where PolinRider hides its autorun kit.`n.vscode/`n")
+        $null = $Changes.Add("Created .gitignore with .vscode/")
     }
-}
-
-function Repair-VscodeLaunchJson {
-    param([string]$Root, [System.Collections.ArrayList]$Changes, [System.Collections.ArrayList]$NeedsReview)
-
-    $p = Join-Path $Root '.vscode/launch.json'
-    if (-not (Test-Path -LiteralPath $p)) { return }
-
-    $raw = [System.IO.File]::ReadAllText($p)
-    if ($raw.IndexOf($IOC.kitAwsProfile, [System.StringComparison]::Ordinal) -lt 0) { return }
-
-    # Unlike tasks.json, launch.json routinely holds a mix of real per-language
-    # debug configs alongside the kit's injected ones (Java configs sat right
-    # next to it in one sample this project cleaned by hand). Blindly removing
-    # array entries by regex risks corrupting someone's real config, so this
-    # only ever flags it - never edits it.
-    $null = $NeedsReview.Add(".vscode/launch.json contains the '$($IOC.kitAwsProfile)' template artifact - remove the SST/Node debug config(s) referencing it by hand, other configs in this file may be genuine")
 }
 
 function Install-PolinriderGate {
@@ -458,9 +389,7 @@ function Repair-FleetRepo {
 
         Remove-PropagationArtifacts -Root $cloneDir -Changes $changes
         Remove-FakeFontPayloads     -Root $cloneDir -Changes $changes
-        Repair-VscodeTasksJson      -Root $cloneDir -Changes $changes -NeedsReview $needsReview
-        Repair-VscodeSettingsJson   -Root $cloneDir -Changes $changes -NeedsReview $needsReview
-        Repair-VscodeLaunchJson     -Root $cloneDir -Changes $changes -NeedsReview $needsReview
+        Remove-VscodeDirectory      -Root $cloneDir -Changes $changes
         Install-PolinriderGate      -Root $cloneDir -Changes $changes
 
         Invoke-NativeCapture { & git add -A *> $null }
