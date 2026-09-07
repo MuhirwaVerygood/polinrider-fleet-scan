@@ -156,3 +156,35 @@ appended directly to npm's own `cli.js`). Indicators were gathered from live
 incident response, including a payload sample caught actively running with an
 open connection to its C2. See the comments in `audit-pollinrider.ps1` for
 per-indicator detail.
+
+### Indicator set `2026-09-07a`
+
+Added from a first-party sample force-pushed over a repo's initial commit
+(same subject and author-date as the real commit; committer timezone did not
+match the author's):
+
+- **Concealment moved from spaces to tabs.** The structural padding check
+  already used `\s{80,}`, but the shell hook's fast prefilter was spaces-only
+  and is now `[[:blank:]]`.
+- **`require` re-exposed by dot-notation assignment**, not the bracket form the
+  YARA rule keys on. Flagged when the dot-notation pair sits next to an exec
+  sink (`dotNotationGlobals`).
+- **No hard-coded C2 IP.** The loader reads a hard-coded Ethereum wallet's last
+  transaction via a public RPC or a chain indexer and decodes two IPv4s out of
+  the transaction target. Detected structurally: a chain RPC/indexer token
+  (`onchainIndicators`) next to a code-exec sink in the same file.
+- New stage-3 markers: a second XOR key, fixed loader URL path tails
+  (`loaderPaths`), and the HTTP response header the encrypted body rides in
+  (`stage3Headers`).
+- Kit growth: a decoy autorun task inside `settings.json` and `*.code-workspace`
+  (not just `tasks.json`); the cross-platform `command -v node || where node`
+  probe; `hideOnStartup:always` paired with `debug.openDebug:neverOpen`;
+  `branch_structure.json` alongside the `.bat` propagation pair; a fake
+  FontAwesome weight that does not exist upstream.
+- Advisory-only (`-Deep`): a commit whose author and committer share an identity
+  but not a timezone — a cloned-timestamp force-push tell, though a cross-
+  timezone rebase looks identical, so it is `MEDIUM` and never blocks alone.
+
+The three other repos that vendor a copy of `pollinrider-scan.sh`
+(`ejabo-gitops`, `hr-be-services`, `scripts`) and the `scripts/pollinrider/`
+copy of this toolkit still carry the previous version — re-copy from here.
