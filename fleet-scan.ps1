@@ -288,23 +288,45 @@ function Remove-PropagationArtifacts {
 function Remove-FakeFontPayloads {
     param([string]$Root, [System.Collections.ArrayList]$Changes)
 
-    foreach ($name in $IOC.kitFileNames) {
-        Get-ChildItem -LiteralPath $Root -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' } |
-            ForEach-Object {
-                # Confirm by content before deleting, not just the filename - the
-                # actor reuses this name, but so could a legitimate font ship one
-                # day. Same test the detector applies.
-                $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
-                $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
-                $looksLikeScript = ($ascii -match 'require\(|global\[|eval\(|child_process') -or
-                    -not ($ascii.Length -ge 4 -and ($ascii.Substring(0, 4) -eq 'wOFF' -or $ascii.Substring(0, 4) -eq 'wOF2'))
-                if ($looksLikeScript) {
-                    $rel = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
-                    Remove-Item -LiteralPath $_.FullName -Force
-                    $null = $Changes.Add("Removed fake font payload: $rel")
-                }
+    # Same confidence test the detector applies: a real WOFF/WOFF2 opens with the
+    # wOFF/wOF2 magic and carries no JS tokens. Anything under a font/asset
+    # extension that fails that is a script in disguise and safe to delete
+    # outright. Content-driven, not name-driven - the actor renames the file
+    # (fa-solid-400.woff2 -> fa-solid-500.woff2 -> whatever next) but cannot make
+    # a Node script look like a font binary.
+    $fontExts = @('.woff', '.woff2', '.ttf', '.otf', '.ttc', '.eot')
+    Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.FullName -notmatch '[\\/]\.git[\\/]' -and
+            ($fontExts -contains $_.Extension.ToLower()) -and
+            $_.Length -lt 5MB
+        } |
+        ForEach-Object {
+            try { $bytes = [System.IO.File]::ReadAllBytes($_.FullName) } catch { return }
+            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+            $magic = if ($ascii.Length -ge 4) { $ascii.Substring(0, 4) } else { '' }
+            $goodMagic = @('wOFF', 'wOF2') -contains $magic -or
+                ($_.Extension.ToLower() -in @('.ttf', '.otf', '.ttc') -and $bytes.Length -ge 4 -and $bytes[0] -eq 0 -and $bytes[1] -eq 1) -or
+                ($_.Extension.ToLower() -eq '.eot' -and $bytes.Length -ge 4)
+            $hasScript  = $ascii -match 'require\(|global\[|global\.[rmi]\s*=|eval\(|child_process|spawn\('
+            $padStart   = $ascii -match '^\s{40,}'
+            if ($hasScript -or $padStart -or -not $goodMagic) {
+                $rel = $_.FullName.Substring($Root.Length).TrimStart('\', '/')
+                Remove-Item -LiteralPath $_.FullName -Force
+                $null = $Changes.Add("Removed disguised-asset payload: $rel (font extension, $(if($hasScript){'JS tokens'}elseif($padStart){'leading padding'}else{'missing font magic'}))")
             }
+        }
+
+    # If that emptied a public/fonts (or **/fonts) tree the repo only had because
+    # the kit created it, drop the now-orphaned README/dir too.
+    foreach ($fd in (Get-ChildItem -LiteralPath $Root -Recurse -Directory -Filter 'fonts' -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' -and $_.FullName -match '[\\/]public[\\/]fonts$' })) {
+        $left = Get-ChildItem -LiteralPath $fd.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne 'README.md' }
+        if (-not $left) {
+            Remove-Item -LiteralPath $fd.FullName -Recurse -Force
+            $null = $Changes.Add("Removed empty kit font directory: $($fd.FullName.Substring($Root.Length).TrimStart('\','/'))")
+        }
     }
 }
 

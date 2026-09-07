@@ -270,13 +270,48 @@ function Test-PayloadSignatures {
         }
     }
 
-    # Re-injection primitive documented in the dossier.
-    $spawnIdx = Find-Literal -Content $Content -Needle $IOC.spawnStub
-    if ($spawnIdx -ge 0 -and $injKey) {
+    # Re-injection primitive documented in the dossier. spawnStubs (array, added
+    # 2026-09) covers the double-quoted spawn("node" and the spawn("node",["-e"
+    # forms the on-chain-resolver build uses; spawnStub (scalar) kept for
+    # back-compat with an older iocs.b64.
+    $spawnNeedles = @()
+    if ($IOC.spawnStub)  { $spawnNeedles += $IOC.spawnStub }
+    if ($IOC.spawnStubs) { $spawnNeedles += $IOC.spawnStubs }
+    $spawnIdx = -1
+    foreach ($sn in ($spawnNeedles | Sort-Object -Unique)) {
+        $si = Find-Literal -Content $Content -Needle $sn
+        if ($si -ge 0) { $spawnIdx = $si; break }
+    }
+
+    # 2026-09 variant re-exposes the loader with dot-notation assignment instead
+    # of the bracket form the YARA rule and $IOC.globalReq/globalMod look for.
+    # Needles come from $IOC.dotNotationGlobals (iocs.b64); treat a matched
+    # require+module pair as loader globals too.
+    $dotLoader = $false
+    if ($IOC.dotNotationGlobals) {
+        $dotReq = $false; $dotMod = $false
+        foreach ($g in $IOC.dotNotationGlobals) {
+            $gi = Find-Literal -Content $Content -Needle $g
+            if ($gi -lt 0) { continue }
+            if ($g -match 'require') { $dotReq = $true }
+            if ($g -match 'module')  { $dotMod = $true }
+        }
+        $dotLoader = $dotReq -and $dotMod
+    }
+    $execSink = [regex]::IsMatch($Content, 'eval\(|new Function\(|Function\(\s*["'']|\bexecSync\(|child_process')
+    if ($dotLoader -and $execSink) {
+        $gi = Find-Literal -Content $Content -Needle ($IOC.dotNotationGlobals | Where-Object { $_ -match 'require' } | Select-Object -First 1)
+        Add-Finding -Severity 'CRITICAL' -Category 'Payload' -File $Rel `
+            -Line (Get-LineNumber $Content ([Math]::Max($gi,0))) `
+            -Indicator 'Loader globals re-exposed (dot notation) with an exec sink' `
+            -Evidence 'dot-notation require/module re-expose next to a code-exec sink - 2026-09 variant'
+    }
+
+    if ($spawnIdx -ge 0 -and ($injKey -or $dotLoader)) {
         Add-Finding -Severity 'CRITICAL' -Category 'Payload' -File $Rel `
             -Line (Get-LineNumber $Content $spawnIdx) `
             -Indicator 'child_process spawn re-injection stub' `
-            -Evidence 'Payload respawns itself in a child node process'
+            -Evidence 'Payload respawns itself in a detached child node process'
     }
 }
 
@@ -379,41 +414,95 @@ function Test-NetworkIocs {
             -Line (Get-LineNumber $Content $u) `
             -Indicator 'Weaponized take-home template UUID' -Evidence $IOC.stakingUuid
     }
+
+    # 2026-09 stage-3 loader: fixed URL paths and the header the encrypted body
+    # is delivered in. Literal, so cheap and unambiguous.
+    foreach ($lp in $IOC.loaderPaths) {
+        $i = Find-Literal -Content $Content -Needle $lp
+        if ($i -ge 0) {
+            Add-Finding -Severity 'CRITICAL' -Category 'C2' -File $Rel `
+                -Line (Get-LineNumber $Content $i) `
+                -Indicator 'PolinRider stage-3 loader URL path' -Evidence $lp
+        }
+    }
+    foreach ($hd in $IOC.stage3Headers) {
+        $i = Find-Literal -Content $Content -Needle $hd
+        if ($i -ge 0) {
+            Add-Finding -Severity 'HIGH' -Category 'C2' -File $Rel `
+                -Line (Get-LineNumber $Content $i) `
+                -Indicator 'PolinRider stage-3 delivery header' -Evidence $hd
+        }
+    }
+
+    # On-chain dead-drop resolver (2026-09): the loader carries no hard-coded C2
+    # IP - it reads a hard-coded Ethereum wallet's last tx via a public RPC / a
+    # chain indexer and decodes the C2 out of the tx `to` field. An ETH RPC or
+    # indexer token is not malicious on its own, so this only fires when it sits
+    # next to a code-exec sink in the same file.
+    if ($IOC.onchainIndicators) {
+        $ocIdx = -1; $ocHit = ''
+        foreach ($oc in $IOC.onchainIndicators) {
+            $i = Find-Literal -Content $Content -Needle $oc
+            if ($i -ge 0) { $ocIdx = $i; $ocHit = $oc; break }
+        }
+        if ($ocIdx -ge 0 -and [regex]::IsMatch($Content, 'eval\(|new Function\(|Function\(\s*["'']|\bspawn\(|\bexecSync\(|child_process')) {
+            Add-Finding -Severity 'CRITICAL' -Category 'C2' -File $Rel `
+                -Line (Get-LineNumber $Content $ocIdx) `
+                -Indicator 'On-chain C2 dead-drop resolver' `
+                -Evidence "Chain RPC/indexer token ($ocHit) next to a code-exec sink - no hard-coded IP to match"
+        }
+    }
 }
 
 function Test-TasksJson {
     param([string]$Root)
 
-    $p = Join-Path $Root '.vscode/tasks.json'
-    if (-not (Test-Path -LiteralPath $p)) { return }
-
-    $c = [System.IO.File]::ReadAllText($p)
-    if ($c -notmatch 'folderOpen') { return }
-
-    $sev = 'MEDIUM'
-    $note = 'Task auto-runs when the folder is opened'
-
-    if ($c -match 'curl|wget|Invoke-WebRequest|bash -c|powershell -') {
-        $sev = 'CRITICAL'
-        $note = 'Auto-run task fetches and executes remote content'
+    # Not just .vscode/tasks.json: the 2026-09 kit put the real task there but
+    # also planted a decoy one inside settings.json, and *.code-workspace files
+    # carry a "tasks" block too.
+    $cands = @()
+    foreach ($rel in @('.vscode/tasks.json', '.vscode/settings.json')) {
+        $fp = Join-Path $Root $rel
+        if (Test-Path -LiteralPath $fp) { $cands += [pscustomobject]@{ Rel = $rel; Path = $fp } }
     }
+    Get-ChildItem -LiteralPath $Root -Recurse -File -Filter '*.code-workspace' -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-ExcludedPath $_.FullName) } |
+        ForEach-Object { $cands += [pscustomobject]@{ Rel = $_.FullName.Substring($Root.Length).TrimStart('\','/'); Path = $_.FullName } }
 
-    # An interpreter pointed at a non-code asset is the fake-font execution vector:
-    # the payload hides under a font/image extension so the task line looks benign.
-    $assetExec = [regex]::Match($c, '(node|deno|bun|python3?|py)\s+[^\s"|&;]*\.(woff2?|ttf|otf|eot|png|jpe?g|gif|ico|dat|bin|svg)\b')
-    if ($assetExec.Success) {
-        $sev = 'CRITICAL'
-        $note = "Auto-run task executes a non-code asset: $($assetExec.Value)"
-    }
+    foreach ($cand in $cands) {
+        $c = [System.IO.File]::ReadAllText($cand.Path)
+        $rel = $cand.Rel
+        $autoruns = ($c -match 'folderOpen')
 
-    Add-Finding -Severity $sev -Category 'TasksJacker' -File '.vscode/tasks.json' -Line 1 `
-        -Indicator 'Task configured to run on folder open' -Evidence $note
-
-    # Silencing flags are what make the above invisible in normal use.
-    if ($c -match '"hide"\s*:\s*true' -and $c -match '"reveal"\s*:\s*"never"') {
-        Add-Finding -Severity 'HIGH' -Category 'TasksJacker' -File '.vscode/tasks.json' -Line 1 `
-            -Indicator 'Auto-run task hidden from the task list and terminal' `
-            -Evidence 'hide:true with presentation.reveal:never'
+        # An interpreter pointed at a non-code asset is the fake-font execution
+        # vector - flagged whether or not it is wired to folderOpen (folderOpen
+        # only decides how loud it is).
+        $assetExec = [regex]::Match($c, '(node|deno|bun|npx|python3?|py)\s+[^\s"|&;]*\.(woff2?|ttf|otf|ttc|eot|png|jpe?g|gif|ico|dat|bin|svg|map|css)\b')
+        if ($assetExec.Success) {
+            Add-Finding -Severity ($(if ($autoruns) { 'CRITICAL' } else { 'HIGH' })) -Category 'TasksJacker' -File $rel -Line 1 `
+                -Indicator 'Editor task runs an interpreter against a non-code asset' `
+                -Evidence "$($assetExec.Value)$(if($autoruns){' (runOn: folderOpen)'})"
+        }
+        if ($autoruns -and ($c -match 'curl|wget|Invoke-WebRequest|iwr |bash -c|powershell -[eE]')) {
+            Add-Finding -Severity 'CRITICAL' -Category 'TasksJacker' -File $rel -Line 1 `
+                -Indicator 'Auto-run task fetches and executes remote content' -Evidence 'folderOpen + a network fetch command'
+        }
+        # The cross-platform node probe from the kit: (command -v node ...) || (where node ...)
+        if (($c -match 'command -v node') -and ($c -match 'where node|>nul')) {
+            Add-Finding -Severity 'CRITICAL' -Category 'TasksJacker' -File $rel -Line 1 `
+                -Indicator 'Canned cross-platform node probe from the PolinRider kit' `
+                -Evidence '(command -v node ... || where node ...) - runs the payload on any OS'
+        }
+        if ($autoruns) {
+            Add-Finding -Severity 'MEDIUM' -Category 'TasksJacker' -File $rel -Line 1 `
+                -Indicator 'Task configured to run on folder open' -Evidence 'runOn: folderOpen'
+        }
+        # Silencing flags are what make an autorun task invisible in normal use.
+        if (($c -match '"hide"\s*:\s*true') -and ($c -match '"reveal"\s*:\s*"never"')) {
+            Add-Finding -Severity 'HIGH' -Category 'TasksJacker' -File $rel -Line 1 `
+                -Indicator 'Auto-run task hidden from the task list and terminal' `
+                -Evidence 'hide:true with presentation.reveal:never'
+        }
     }
 }
 
@@ -435,6 +524,14 @@ function Test-VsCodeSettings {
         Add-Finding -Severity 'MEDIUM' -Category 'TasksJacker' -File '.vscode/settings.json' -Line 1 `
             -Indicator 'Integrated terminal hidden on startup' `
             -Evidence 'Conceals output of any task that runs at folder open'
+    }
+    # 2026-09 kit pairs the hidden terminal with a suppressed debug view, so a
+    # payload that pops either window shows nothing.
+    if (($c -match '"terminal\.integrated\.hideOnStartup"\s*:\s*"always"') -and
+        ($c -match '"debug\.openDebug"\s*:\s*"neverOpen"')) {
+        Add-Finding -Severity 'HIGH' -Category 'TasksJacker' -File '.vscode/settings.json' -Line 1 `
+            -Indicator 'Window-hiding settings paired (hideOnStartup + debug.openDebug:neverOpen)' `
+            -Evidence 'Suppresses any window a folder-open payload would surface'
     }
 }
 
@@ -926,15 +1023,35 @@ function Test-GitHistory {
     param([string]$Root)
 
     $log = & git -C $Root log --all --format="%H%x09%s" -n 500 2>$null
-    if (-not $log) { return }
+    if ($log) {
+        foreach ($line in $log) {
+            $parts = $line -split "`t", 2
+            if ($parts.Count -lt 2) { continue }
+            if ($parts[1] -match 'auto[_ -]?push|LAST_COMMIT_DATE') {
+                Add-Finding -Severity 'HIGH' -Category 'History' -File 'git log' -Line 0 `
+                    -Indicator "Suspicious commit subject: $($parts[1])" `
+                    -Evidence $parts[0].Substring(0, 12)
+            }
+        }
+    }
 
-    foreach ($line in $log) {
-        $parts = $line -split "`t", 2
-        if ($parts.Count -lt 2) { continue }
-        if ($parts[1] -match 'auto[_ -]?push|LAST_COMMIT_DATE') {
-            Add-Finding -Severity 'HIGH' -Category 'History' -File 'git log' -Line 0 `
-                -Indicator "Suspicious commit subject: $($parts[1])" `
-                -Evidence $parts[0].Substring(0, 12)
+    # 2026-09 delivery: a force-push that replaced the repo's initial commit with
+    # a new root commit reusing the original subject and author-date, so
+    # `git log --oneline` looked untouched. The committer timezone (-0800) did
+    # not match the author's (+0200) - a cloned-timestamp tell. Weak on its own
+    # (a cross-timezone rebase looks identical), so MEDIUM, not blocking on its
+    # own, and only when author and committer are the same identity.
+    $meta = & git -C $Root log --no-merges --format="%h`t%ae`t%ce`t%ai`t%ci" -n 80 2>$null
+    foreach ($line in $meta) {
+        $p = $line -split "`t"
+        if ($p.Count -lt 5) { continue }
+        if ($p[1] -ne $p[2]) { continue }
+        $atz = ($p[3] -split ' ')[-1]
+        $ctz = ($p[4] -split ' ')[-1]
+        if ($atz -and $ctz -and $atz -ne $ctz) {
+            Add-Finding -Severity 'MEDIUM' -Category 'History' -File 'git log' -Line 0 `
+                -Indicator "Author/committer timezone mismatch on $($p[0])" `
+                -Evidence "author $atz vs committer $ctz, same identity - benign after a cross-TZ rebase, else a cloned-timestamp force-push"
         }
     }
 }
